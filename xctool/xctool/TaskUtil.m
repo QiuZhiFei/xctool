@@ -16,7 +16,6 @@
 
 #import "TaskUtil.h"
 
-#import <poll.h>
 
 #import "NSConcreteTask.h"
 #import "SimDevice.h"
@@ -46,7 +45,7 @@ NSArray *ReadOutputsAndFeedOuputLinesToBlockOnQueue(
   dispatch_queue_t queue)
 {
   NSMutableArray *outputs = [NSMutableArray arrayWithCapacity:sz];
-  struct pollfd fds[sz];
+  int fds[sz];
   dispatch_data_t data[sz];
   size_t processedBytes[sz];
 
@@ -79,9 +78,7 @@ NSArray *ReadOutputsAndFeedOuputLinesToBlockOnQueue(
   };
 
   for (int i = 0; i < sz; i++) {
-    fds[i].fd = fildes[i];
-    fds[i].events = POLLIN;
-    fds[i].revents = 0;
+    fds[i] = fildes[i];
     data[i] = dispatch_data_empty;
     processedBytes[i] = 0;
   }
@@ -89,56 +86,85 @@ NSArray *ReadOutputsAndFeedOuputLinesToBlockOnQueue(
   int remaining = sz;
 
   while (remaining > 0) {
-    int pollResult = poll(fds, sz, -1);
+    int maxFd = 0;
+    fd_set readfds, errorfds;
+    FD_ZERO(&readfds);
+    FD_ZERO(&errorfds);
 
-    if (pollResult == -1) {
+    for (int i = 0; i < sz; i++) {
+      int fd = fds[i];
+      if (fd == -1) {
+        // fd is closed
+        continue;
+      }
+
+      FD_SET(fd, &readfds);
+      FD_SET(fd, &errorfds);
+      maxFd = MAX(fildes[i], maxFd);
+    }
+
+    int selectResult = select(maxFd + 1, &readfds, nil, &errorfds, nil);
+    if (selectResult == -1) {
       switch (errno) {
         case EAGAIN:
         case EINTR:
-          // poll can be restarted
           continue;
+
         default:
-          NSLog(@"error during poll: %@",
+          NSLog(@"error during select(): %@",
                 [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{}]);
           abort();
       }
-    } else if (pollResult == 0) {
+    }
+
+    if (selectResult == 0) {
       NSCAssert(false, @"impossible, polling without timeout");
-    } else {
-      for (int i = 0; i < sz; i++) {
-        if (!(fds[i].revents & (POLLIN | POLLHUP))) {
-          continue;
-        }
+    }
 
-        uint8_t buf[4096] = {0};
-        ssize_t readResult = read(fds[i].fd, buf, (sizeof(buf) / sizeof(uint8_t)));
+    // check if there are descriptors:
+    // - ready for reading, or
+    // - that have an exceptional condition pending.
+    for (int i = 0; i < sz; i++) {
+      int fd = fildes[i];
 
-        if (readResult > 0) {  // some bytes read
-          dispatch_data_t part =
-            dispatch_data_create(buf,
-                                 readResult,
-                                 dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
-                                 // copy data from the buffer
-                                 DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-          dispatch_data_t combined = dispatch_data_create_concat(data[i], part);
-          dispatch_release(part);
-          dispatch_release(data[i]);
-          data[i] = combined;
-        } else if (readResult == 0) {  // eof
-          remaining--;
-          fds[i].fd = -1;
-          fds[i].events = 0;
-        } else if (errno != EINTR) {
-          NSLog(@"error during read: %@", [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{}]);
-          abort();
-        }
-        if (block) {
-          // feed to block unprocessed lines
-          size_t offset = processedBytes[i];
-          size_t size = dispatch_data_get_size(data[i]);
-          dispatch_data_t unprocessedPart = dispatch_data_create_subrange(data[i], offset, size - offset);
-          processedBytes[i] += feedUnprocessedLinesToBlock(fildes[i], unprocessedPart, NO);
-        }
+      // if some exceptional condition then stop reading from this fd
+      if (FD_ISSET(fd, &errorfds)) {
+        remaining--;
+        fds[i] = -1;
+        continue;
+      }
+
+      // move to next fd if this is not available for reading
+      if (!FD_ISSET(fd, &readfds)) {
+        continue;
+      }
+
+      uint8_t buf[4096] = {0};
+      ssize_t readResult = read(fd, buf, (sizeof(buf) / sizeof(uint8_t)));
+      if (readResult > 0) {  // some bytes read
+        dispatch_data_t part =
+          dispatch_data_create(buf,
+                               readResult,
+                               dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                               // copy data from the buffer
+                               DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        dispatch_data_t combined = dispatch_data_create_concat(data[i], part);
+        dispatch_release(part);
+        dispatch_release(data[i]);
+        data[i] = combined;
+      } else if (readResult == 0) {  // eof
+        remaining--;
+        fds[i] = -1;
+      } else if (errno != EINTR) {
+        NSLog(@"error during read: %@", [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{}]);
+        abort();
+      }
+      if (block) {
+        // feed to block unprocessed lines
+        size_t offset = processedBytes[i];
+        size_t size = dispatch_data_get_size(data[i]);
+        dispatch_data_t unprocessedPart = dispatch_data_create_subrange(data[i], offset, size - offset);
+        processedBytes[i] += feedUnprocessedLinesToBlock(fildes[i], unprocessedPart, NO);
       }
     }
   }
