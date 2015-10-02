@@ -16,6 +16,7 @@
 
 #import "TaskUtil.h"
 
+#import <iconv.h>
 
 #import "NSConcreteTask.h"
 #import "SimDevice.h"
@@ -29,6 +30,23 @@ static NSString *StringFromDispatchData(dispatch_data_t data)
   size_t dataSz;
   dispatch_data_t contig = dispatch_data_create_map(data, &dataPtr, &dataSz);
   NSString *str = [[NSString alloc] initWithBytes:dataPtr length:dataSz encoding:NSUTF8StringEncoding];
+  if (!str) {
+    // discard invalid UTF-8 characters in the data
+    int one = 1;
+    iconv_t cd = iconv_open("UTF-8", "UTF-8");
+    iconvctl(cd, ICONV_SET_DISCARD_ILSEQ, &one);
+    size_t inbytesleft = dataSz;
+    size_t outbytesleft = dataSz;
+    char *inbuf  = (char *)dataPtr;
+    char *outbuf = malloc(sizeof(char) * dataSz);
+    char *outptr = outbuf;
+    if (iconv(cd, &inbuf, &inbytesleft, &outptr, &outbytesleft) != (size_t)-1) {
+      str = [[NSString alloc] initWithBytes:outbuf length:dataSz - outbytesleft encoding:NSUTF8StringEncoding];
+    }
+    free(outbuf);
+    iconv_close(cd);
+  }
+
   dispatch_release(contig);
   return str;
 }
